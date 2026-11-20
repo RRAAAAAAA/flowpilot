@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS users (
   role text NOT NULL CHECK (role IN ('employee','approver','admin','auditor')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pw_changed_at timestamptz;
 CREATE TABLE IF NOT EXISTS requests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   org_id uuid NOT NULL REFERENCES organizations(id),

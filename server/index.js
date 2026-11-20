@@ -41,8 +41,11 @@ const setCookie = (res, id) =>
 const auth = wrap(async (req, res, next) => {
   let user;
   try {
-    const { sub } = jwt.verify(req.cookies.fp_token || '', JWT_SECRET);
-    user = (await pool.query('SELECT id,org_id,email,name,role FROM users WHERE id=$1', [sub])).rows[0];
+    const { sub, iat } = jwt.verify(req.cookies.fp_token || '', JWT_SECRET);
+    user = (await pool.query('SELECT id,org_id,email,name,role,pw_changed_at FROM users WHERE id=$1 AND deleted_at IS NULL', [sub])).rows[0];
+    // A password reset signs out every older session.
+    if (user && user.pw_changed_at && iat < Math.floor(new Date(user.pw_changed_at).getTime() / 1000)) user = undefined;
+    if (user) delete user.pw_changed_at;
   } catch {}
   if (!user) return res.status(401).json({ error: 'Not signed in' });
   req.user = user; next();
@@ -71,7 +74,7 @@ app.post('/api/auth/register', authLimiter, wrap(async (req, res) => {
 }));
 
 app.post('/api/auth/login', authLimiter, wrap(async (req, res) => {
-  const u = (await pool.query('SELECT * FROM users WHERE email=$1', [str(req.body.email).toLowerCase()])).rows[0];
+  const u = (await pool.query('SELECT * FROM users WHERE email=$1 AND deleted_at IS NULL', [str(req.body.email).toLowerCase()])).rows[0];
   if (!u || !(await bcrypt.compare(String(req.body.password || ''), u.password_hash))) throw E(401, 'Invalid email or password');
   await audit(pool, u, 'user.login', 'user', u.id);
   setCookie(res, u.id);
@@ -95,7 +98,7 @@ app.patch('/api/org', auth, need('admin'), wrap(async (req, res) => {
 }));
 
 app.get('/api/users', auth, need('admin'), wrap(async (req, res) => {
-  res.json((await pool.query('SELECT id,email,name,role,created_at FROM users WHERE org_id=$1 ORDER BY created_at', [req.user.org_id])).rows);
+  res.json((await pool.query('SELECT id,email,name,role,created_at FROM users WHERE org_id=$1 AND deleted_at IS NULL ORDER BY created_at', [req.user.org_id])).rows);
 }));
 
 app.post('/api/users', auth, need('admin'), wrap(async (req, res) => {
@@ -111,10 +114,39 @@ app.post('/api/users', auth, need('admin'), wrap(async (req, res) => {
 app.patch('/api/users/:id', auth, need('admin'), wrap(async (req, res) => {
   if (!ROLES.includes(req.body.role)) throw E(400, 'Invalid role');
   if (req.params.id === req.user.id) throw E(400, 'You cannot change your own role');
-  const u = (await pool.query('UPDATE users SET role=$1 WHERE id=$2 AND org_id=$3 RETURNING id,email,name,role', [req.body.role, req.params.id, req.user.org_id])).rows[0];
+  const u = (await pool.query('UPDATE users SET role=$1 WHERE id=$2 AND org_id=$3 AND deleted_at IS NULL RETURNING id,email,name,role', [req.body.role, req.params.id, req.user.org_id])).rows[0];
   if (!u) throw E(404, 'Not found');
   await audit(pool, req.user, 'user.role_changed', 'user', u.id, { role: u.role });
   res.json(u);
+}));
+
+// Admins manage the passwords and accounts of approvers, employees and auditors (not other admins).
+const MANAGEABLE = ['employee', 'approver', 'auditor'];
+async function managedUser(req) {
+  const t = (await pool.query('SELECT id,name,email,role FROM users WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL', [req.params.id, req.user.org_id])).rows[0];
+  if (!t) throw E(404, 'Not found');
+  if (!MANAGEABLE.includes(t.role)) throw E(403, 'Only approver, employee and auditor accounts can be managed this way');
+  return t;
+}
+
+app.patch('/api/users/:id/password', auth, need('admin'), wrap(async (req, res) => {
+  const pw = req.body.password;
+  if (typeof pw !== 'string' || pw.length < 8) throw E(400, 'Password must be at least 8 characters');
+  const t = await managedUser(req);
+  await pool.query("UPDATE users SET password_hash=$1, pw_changed_at=date_trunc('second', now()) WHERE id=$2", [await bcrypt.hash(pw, 12), t.id]);
+  await audit(pool, req.user, 'user.password_reset', 'user', t.id, { email: t.email });
+  res.json({ ok: true });
+}));
+
+// Deleting is a soft delete: the person can no longer sign in and the email is freed,
+// but their name stays so past requests and the audit log still make sense.
+app.delete('/api/users/:id', auth, need('admin'), wrap(async (req, res) => {
+  const t = await managedUser(req);
+  await tx(async c => {
+    await c.query("UPDATE users SET deleted_at=now(), email=$2, password_hash='!', pw_changed_at=now() WHERE id=$1", [t.id, `deleted-${t.id}@removed.invalid`]);
+    await audit(c, req.user, 'user.deleted', 'user', t.id, { name: t.name, email: t.email, role: t.role });
+  });
+  res.json({ ok: true });
 }));
 
 // ---------- requests ----------
@@ -142,7 +174,10 @@ app.get('/api/requests/:id', auth, wrap(async (req, res) => {
   if (!r) throw E(404, 'Not found');
   const steps = (await pool.query('SELECT a.step,a.role_required,a.status,a.comment,a.acted_at,u.name AS acted_by_name FROM approval_assignments a LEFT JOIN users u ON u.id=a.acted_by WHERE a.request_id=$1 ORDER BY a.step', [r.id])).rows;
   const history = (await pool.query("SELECT l.action,l.details,l.created_at,u.name AS actor FROM audit_logs l LEFT JOIN users u ON u.id=l.actor_id WHERE l.org_id=$1 AND l.entity_type='request' AND l.entity_id=$2 ORDER BY l.id", [req.user.org_id, r.id])).rows;
-  res.json({ ...r, steps, history });
+  const pend = (await pool.query("SELECT id,role_required FROM approval_assignments WHERE request_id=$1 AND status='pending' ORDER BY step LIMIT 1", [r.id])).rows[0];
+  const own = r.requester_id === req.user.id;
+  const can = !!pend && !own && (req.user.role === 'admin' || req.user.role === pend.role_required);
+  res.json({ ...r, steps, history, is_own: own, waiting_on: pend ? pend.role_required : null, can_decide: can, pending_step_id: can ? pend.id : null });
 }));
 
 // Routing is decided here, in code, and frozen on the request (chain) at submit time.
@@ -161,9 +196,9 @@ app.post('/api/requests/:id/submit', auth, wrap(async (req, res) => {
 
 // ---------- approvals ----------
 app.get('/api/approvals/pending', auth, wrap(async (req, res) => {
-  res.json((await pool.query(`SELECT a.id, a.step, a.role_required, r.id AS request_id, r.title, r.description, r.amount, r.currency, r.category, r.submitted_at, u.name AS requester_name
+  res.json((await pool.query(`SELECT a.id, a.step, a.role_required, (r.requester_id=$2) AS own, r.id AS request_id, r.title, r.description, r.amount, r.currency, r.category, r.submitted_at, u.name AS requester_name
     FROM approval_assignments a JOIN requests r ON r.id=a.request_id JOIN users u ON u.id=r.requester_id
-    WHERE a.org_id=$1 AND a.status='pending' AND r.requester_id<>$2 AND ($3::text='admin' OR a.role_required=$3::text) ORDER BY r.submitted_at`,
+    WHERE a.org_id=$1 AND a.status='pending' AND (r.requester_id=$2 OR $3::text='admin' OR a.role_required=$3::text) ORDER BY r.submitted_at`,
     [req.user.org_id, req.user.id, req.user.role])).rows);
 }));
 
@@ -194,7 +229,11 @@ app.post('/api/approvals/:id/:action(approve|reject)', auth, wrap(async (req, re
 
 // ---------- audit & dashboard ----------
 app.get('/api/audit', auth, need('admin', 'auditor'), wrap(async (req, res) => {
-  res.json((await pool.query('SELECT l.id,l.action,l.entity_type,l.entity_id,l.details,l.created_at,u.name AS actor FROM audit_logs l LEFT JOIN users u ON u.id=l.actor_id WHERE l.org_id=$1 ORDER BY l.id DESC LIMIT 200', [req.user.org_id])).rows);
+  res.json((await pool.query(`SELECT l.id,l.action,l.entity_type,l.entity_id,l.details,l.created_at,u.name AS actor, COALESCE(rq.title, tu.name) AS target
+    FROM audit_logs l LEFT JOIN users u ON u.id=l.actor_id
+    LEFT JOIN requests rq ON l.entity_type='request' AND rq.id=l.entity_id
+    LEFT JOIN users tu ON l.entity_type='user' AND tu.id=l.entity_id
+    WHERE l.org_id=$1 ORDER BY l.id DESC LIMIT 200`, [req.user.org_id])).rows);
 }));
 
 app.get('/api/stats', auth, need('admin', 'auditor'), wrap(async (req, res) => {

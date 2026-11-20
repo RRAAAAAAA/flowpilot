@@ -8,7 +8,7 @@ Stack: React (Vite) + Node/Express + PostgreSQL. One Railway service serves both
 |---|---|
 | employee | Create, submit and track own requests |
 | approver | Everything an employee can, plus decide requests routed to approvers |
-| admin | Manage users and the approval threshold, decide any step, view dashboard and audit log |
+| admin | Manage users (add, change role, reset password, delete approver/employee/auditor accounts) and the approval threshold, decide any step, view dashboard and audit log |
 | auditor | Read-only: all submitted requests, dashboard, audit log |
 
 Rules enforced in the backend: nobody can decide their own request; requests at or above the organization's
